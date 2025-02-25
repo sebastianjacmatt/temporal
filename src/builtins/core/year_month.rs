@@ -294,24 +294,13 @@ impl FromStr for PlainYearMonth {
 
         let date = record.date.temporal_unwrap()?;
 
-        // The below steps are from `ToTemporalYearMonth`
-        // 10. Let isoDate be CreateISODateRecord(result.[[Year]], result.[[Month]], result.[[Day]]).
-        let iso = IsoDate::new_unchecked(date.year, date.month, date.day);
-
-        // 11. If ISOYearMonthWithinLimits(isoDate) is false, throw a RangeError exception.
-        if !year_month_within_limits(iso.year, iso.month) {
-            return Err(TemporalError::range().with_message("Exceeded valid range."));
-        }
-
-        let intermediate = Self::new_unchecked(iso, calendar);
-        // 12. Set result to ISODateToFields(calendar, isoDate, year-month).
-        let partial = PartialDate::try_from_year_month(&intermediate)?;
-        // 13. NOTE: The following operation is called with constrain regardless of the
-        // value of overflow, in order for the calendar to store a canonical value in the
-        // [[Day]] field of the [[ISODate]] internal slot of the result.
-        // 14. Set isoDate to ? CalendarYearMonthFromFields(calendar, result, constrain).
-        // 15. Return ! CreateTemporalYearMonth(isoDate, calendar).
-        PlainYearMonth::from_partial(partial, ArithmeticOverflow::Constrain)
+        Self::new_with_overflow(
+            date.year,
+            date.month,
+            None,
+            calendar,
+            ArithmeticOverflow::Reject,
+        )
     }
 }
 
