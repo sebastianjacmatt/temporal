@@ -6,14 +6,14 @@ use core::{cmp::Ordering, str::FromStr};
 use tinystr::TinyAsciiStr;
 
 use crate::{
-    iso::IsoDate,
-    options::{ArithmeticOverflow, DisplayCalendar},
+    iso::{year_month_within_limits, IsoDate},
+    options::{ArithmeticOverflow, DifferenceOperation, DifferenceSettings, DisplayCalendar},
     parsers::{FormattableCalendar, FormattableDate, FormattableYearMonth},
     utils::pad_iso_year,
-    Calendar, TemporalError, TemporalResult, TemporalUnwrap,
+    Calendar, MonthCode, TemporalError, TemporalResult, TemporalUnwrap,
 };
 
-use super::{Duration, PartialDate};
+use super::{Duration, PartialDate, PlainDate};
 
 /// The native Rust implementation of `Temporal.YearMonth`.
 #[non_exhaustive]
@@ -37,6 +37,40 @@ impl PlainYearMonth {
         Self { iso, calendar }
     }
 
+    /// Internal addition method for adding `Duration` to a `PlainYearMonth`
+    pub(crate) fn add_or_subtract_duration(
+        &self,
+        duration: &Duration,
+        overflow: ArithmeticOverflow,
+    ) -> TemporalResult<Self> {
+        // Potential TODO: update to current Temporal specification
+        let partial = PartialDate::try_from_year_month(self)?;
+
+        let mut intermediate_date = self.calendar().date_from_partial(&partial, overflow)?;
+
+        intermediate_date = intermediate_date.add_date(duration, Some(overflow))?;
+
+        let result_fields = PartialDate::default().with_fallback_date(&intermediate_date)?;
+
+        self.calendar()
+            .year_month_from_partial(&result_fields, overflow)
+    }
+
+    /// The internal difference operation of `PlainYearMonth`.
+    pub(crate) fn diff(
+        &self,
+        _op: DifferenceOperation,
+        _other: &Self,
+        _settings: DifferenceSettings,
+    ) -> TemporalResult<Duration> {
+        // TODO: implement
+        Err(TemporalError::general("Not yet implemented"))
+    }
+}
+
+// ==== Public method implementations ====
+
+impl PlainYearMonth {
     /// Creates a new valid `YearMonth`.
     #[inline]
     pub fn new_with_overflow(
@@ -47,8 +81,19 @@ impl PlainYearMonth {
         overflow: ArithmeticOverflow,
     ) -> TemporalResult<Self> {
         let day = reference_day.unwrap_or(1);
-        let iso = IsoDate::new_with_overflow(year, month, day, overflow)?;
+        let iso = IsoDate::regulate(year, month, day, overflow)?;
+        if !year_month_within_limits(iso.year, iso.month) {
+            return Err(TemporalError::range().with_message("Exceeded valid range."));
+        }
         Ok(Self::new_unchecked(iso, calendar))
+    }
+
+    /// Create a `PlainYearMonth` from a `PartialDate`
+    pub fn from_partial(
+        partial: PartialDate,
+        overflow: ArithmeticOverflow,
+    ) -> TemporalResult<Self> {
+        partial.calendar.year_month_from_partial(&partial, overflow)
     }
 
     /// Returns the iso year value for this `YearMonth`.
@@ -93,7 +138,7 @@ impl PlainYearMonth {
     }
 
     /// Returns the calendar month code of the current `PlainYearMonth`
-    pub fn month_code(&self) -> TemporalResult<TinyAsciiStr<4>> {
+    pub fn month_code(&self) -> TemporalResult<MonthCode> {
         self.calendar().month_code(&self.iso)
     }
 
@@ -181,15 +226,15 @@ impl PlainYearMonth {
         self.iso.cmp(&other.iso)
     }
 
-    pub fn add_duration(
-        &self,
-        duration: &Duration,
-        overflow: ArithmeticOverflow,
-    ) -> TemporalResult<Self> {
+    /// Adds a [`Duration`] from the current `PlainYearMonth`.
+    #[inline]
+    pub fn add(&self, duration: &Duration, overflow: ArithmeticOverflow) -> TemporalResult<Self> {
         self.add_or_subtract_duration(duration, overflow)
     }
 
-    pub fn subtract_duration(
+    /// Subtracts a [`Duration`] from the current `PlainYearMonth`.
+    #[inline]
+    pub fn subtract(
         &self,
         duration: &Duration,
         overflow: ArithmeticOverflow,
@@ -197,23 +242,24 @@ impl PlainYearMonth {
         self.add_or_subtract_duration(&duration.negated(), overflow)
     }
 
-    pub(crate) fn add_or_subtract_duration(
-        &self,
-        duration: &Duration,
-        overflow: ArithmeticOverflow,
-    ) -> TemporalResult<Self> {
-        let partial = PartialDate::try_from_year_month(self)?;
-
-        let mut intermediate_date = self.calendar().date_from_partial(&partial, overflow)?;
-
-        intermediate_date = intermediate_date.add_date(duration, Some(overflow))?;
-
-        let result_fields = PartialDate::default().with_fallback_date(&intermediate_date)?;
-
-        self.calendar()
-            .year_month_from_partial(&result_fields, overflow)
+    /// Returns a `Duration` representing the period of time from this `PlainYearMonth` until the other `PlainYearMonth`.
+    #[inline]
+    pub fn until(&self, other: &Self, settings: DifferenceSettings) -> TemporalResult<Duration> {
+        self.diff(DifferenceOperation::Until, other, settings)
     }
 
+    /// Returns a `Duration` representing the period of time from this `PlainYearMonth` since the other `PlainYearMonth`.
+    #[inline]
+    pub fn since(&self, other: &Self, settings: DifferenceSettings) -> TemporalResult<Duration> {
+        self.diff(DifferenceOperation::Since, other, settings)
+    }
+
+    pub fn to_plain_date(&self) -> TemporalResult<PlainDate> {
+        Err(TemporalError::general("Not yet iimplemented."))
+    }
+
+    /// Returns a RFC9557 IXDTF string for the current `PlainYearMonth`
+    #[inline]
     pub fn to_ixdtf_string(&self, display_calendar: DisplayCalendar) -> String {
         let ixdtf = FormattableYearMonth {
             date: FormattableDate(self.iso_year(), self.iso_month(), self.iso.day),
@@ -231,12 +277,20 @@ impl FromStr for PlainYearMonth {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let record = crate::parsers::parse_year_month(s)?;
-
         let calendar = record
             .calendar
             .map(Calendar::from_utf8)
             .transpose()?
             .unwrap_or_default();
+
+        // ParseISODateTime
+        // Step 4.a.ii.3
+        // If goal is TemporalMonthDayString or TemporalYearMonthString, calendar is
+        // not empty, and the ASCII-lowercase of calendar is not "iso8601", throw a
+        // RangeError exception.
+        if !calendar.is_iso() {
+            return Err(TemporalError::range().with_message("non-ISO calendar not supported."));
+        }
 
         let date = record.date.temporal_unwrap()?;
 
@@ -252,8 +306,9 @@ impl FromStr for PlainYearMonth {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tinystr::tinystr;
+
+    use super::*;
 
     #[test]
     fn test_plain_year_month_with() {
@@ -277,7 +332,7 @@ mod tests {
         assert_eq!(with_year.iso_month(), 3); // month is not changed
         assert_eq!(
             with_year.month_code().unwrap(),
-            TinyAsciiStr::<4>::from_str("M03").unwrap()
+            MonthCode::from_str("M03").unwrap()
         ); // assert month code has been initialized correctly
 
         // Month
@@ -290,19 +345,19 @@ mod tests {
         assert_eq!(with_month.iso_month(), 2); // month is changed
         assert_eq!(
             with_month.month_code().unwrap(),
-            TinyAsciiStr::<4>::from_str("M02").unwrap()
+            MonthCode::from_str("M02").unwrap()
         ); // assert month code has changed as well as month
 
         // Month Code
         let partial = PartialDate {
-            month_code: Some(tinystr!(4, "M05")), // change month to May (5)
+            month_code: Some(MonthCode(tinystr!(4, "M05"))),
             ..Default::default()
         };
         let with_month_code = base.with(partial, None).unwrap();
         assert_eq!(with_month_code.iso_year(), 2025); // year is not changed
         assert_eq!(
             with_month_code.month_code().unwrap(),
-            TinyAsciiStr::<4>::from_str("M05").unwrap()
+            MonthCode::from_str("M05").unwrap()
         ); // assert month code has changed
         assert_eq!(with_month_code.iso_month(), 5); // month is changed as well
 

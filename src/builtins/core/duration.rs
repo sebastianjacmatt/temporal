@@ -16,7 +16,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::str::FromStr;
+use core::{cmp::Ordering, str::FromStr};
 use ixdtf::parsers::{
     records::{DateDurationRecord, DurationParseRecord, Sign as IxdtfSign, TimeDurationRecord},
     IsoDurationParser,
@@ -277,6 +277,63 @@ impl Duration {
     pub fn is_time_within_range(&self) -> bool {
         self.time.is_within_range()
     }
+
+    #[inline]
+    pub fn compare_with_provider(
+        &self,
+        other: &Duration,
+        relative_to: Option<RelativeTo>,
+        provider: &impl TimeZoneProvider,
+    ) -> TemporalResult<Ordering> {
+        if self.date == other.date && self.time == other.time {
+            return Ok(Ordering::Equal);
+        }
+        // 8. Let largestUnit1 be DefaultTemporalLargestUnit(one).
+        // 9. Let largestUnit2 be DefaultTemporalLargestUnit(two).
+        let largest_unit_1 = self.default_largest_unit();
+        let largest_unit_2 = other.default_largest_unit();
+        // 10. Let duration1 be ToInternalDurationRecord(one).
+        // 11. Let duration2 be ToInternalDurationRecord(two).
+        // 12. If zonedRelativeTo is not undefined, and either TemporalUnitCategory(largestUnit1) or TemporalUnitCategory(largestUnit2) is date, then
+        if let Some(RelativeTo::ZonedDateTime(zdt)) = relative_to.as_ref() {
+            if largest_unit_1.is_date_unit() || largest_unit_2.is_date_unit() {
+                // a. Let timeZone be zonedRelativeTo.[[TimeZone]].
+                // b. Let calendar be zonedRelativeTo.[[Calendar]].
+                // c. Let after1 be ? AddZonedDateTime(zonedRelativeTo.[[EpochNanoseconds]], timeZone, calendar, duration1, constrain).
+                // d. Let after2 be ? AddZonedDateTime(zonedRelativeTo.[[EpochNanoseconds]], timeZone, calendar, duration2, constrain).
+                let after1 = zdt.add_as_instant(self, ArithmeticOverflow::Constrain, provider)?;
+                let after2 = zdt.add_as_instant(other, ArithmeticOverflow::Constrain, provider)?;
+                // e. If after1 > after2, return 1𝔽.
+                // f. If after1 < after2, return -1𝔽.
+                // g. Return +0𝔽.
+                return Ok(after1.cmp(&after2));
+            }
+        }
+        // 13. If IsCalendarUnit(largestUnit1) is true or IsCalendarUnit(largestUnit2) is true, then
+        let (days1, days2) =
+            if largest_unit_1.is_calendar_unit() || largest_unit_2.is_calendar_unit() {
+                // a. If plainRelativeTo is undefined, throw a RangeError exception.
+                // b. Let days1 be ? DateDurationDays(duration1.[[Date]], plainRelativeTo).
+                // c. Let days2 be ? DateDurationDays(duration2.[[Date]], plainRelativeTo).
+                let Some(RelativeTo::PlainDate(pdt)) = relative_to.as_ref() else {
+                    return Err(TemporalError::range());
+                };
+                let days1 = self.date.days(pdt)?;
+                let days2 = other.date.days(pdt)?;
+                (days1, days2)
+            } else {
+                (
+                    self.date.days.as_integer_if_integral()?,
+                    other.date.days.as_integer_if_integral()?,
+                )
+            };
+        // 15. Let timeDuration1 be ? Add24HourDaysToTimeDuration(duration1.[[Time]], days1).
+        let time_duration_1 = self.time.to_normalized().add_days(days1)?;
+        // 16. Let timeDuration2 be ? Add24HourDaysToTimeDuration(duration2.[[Time]], days2).
+        let time_duration_2 = other.time.to_normalized().add_days(days2)?;
+        // 17. Return 𝔽(CompareTimeDuration(timeDuration1, timeDuration2)).
+        Ok(time_duration_1.cmp(&time_duration_2))
+    }
 }
 
 // ==== Public `Duration` Getters/Setters ====
@@ -294,12 +351,6 @@ impl Duration {
     #[must_use]
     pub fn date(&self) -> &DateDuration {
         &self.date
-    }
-
-    /// Set this `DurationRecord`'s `TimeDuration`.
-    #[inline]
-    pub fn set_time_duration(&mut self, time: TimeDuration) {
-        self.time = time;
     }
 
     /// Returns the `years` field of duration.
@@ -323,7 +374,7 @@ impl Duration {
         self.date.weeks
     }
 
-    /// Returns the `weeks` field of duration.
+    /// Returns the `days` field of duration.
     #[inline]
     #[must_use]
     pub const fn days(&self) -> FiniteF64 {
@@ -572,6 +623,7 @@ impl Duration {
                     self.weeks(),
                     self.days().checked_add(&FiniteF64::from(balanced_days))?,
                 )?;
+                // TODO: Should this be using AdjustDateDurationRecord?
 
                 // c. Let targetDate be ? AddDate(calendarRec, plainRelativeTo, dateDuration).
                 let target_date = plain_date.add_date(&Duration::from(date_duration), None)?;
@@ -634,6 +686,17 @@ impl Duration {
         }
     }
 
+    /// Returns the total of the `Duration`
+    pub fn total_with_provider(
+        &self,
+        _unit: TemporalUnit,
+        _relative_to: Option<RelativeTo>,
+        _provider: &impl TimeZoneProvider,
+    ) -> TemporalResult<i64> {
+        Err(TemporalError::general("Not yet implemented"))
+    }
+
+    /// Returns the `Duration` as a formatted string
     pub fn as_temporal_string(&self, options: ToStringRoundingOptions) -> TemporalResult<String> {
         if options.smallest_unit == Some(TemporalUnit::Hour)
             || options.smallest_unit == Some(TemporalUnit::Minute)
